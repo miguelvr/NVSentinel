@@ -44,6 +44,12 @@ type MongoDBClientTLSCertConfig struct {
 	CaCertPath  string
 }
 
+// CertProvider provides TLS configuration for certificate rotation support.
+// Implementations should return a tls.Config configured with dynamic certificate loading.
+type CertProvider interface {
+	GetTLSConfig() *tls.Config
+}
+
 // MongoDBConfig holds the MongoDB connection configuration.
 type MongoDBConfig struct {
 	URI                              string
@@ -56,6 +62,9 @@ type MongoDBConfig struct {
 	TotalCACertIntervalSeconds       int
 	ChangeStreamRetryDeadlineSeconds int
 	ChangeStreamRetryIntervalSeconds int
+	// CertWatcher is an optional certificate provider for automatic certificate rotation.
+	// When provided, it takes precedence over ClientTLSCertConfig for TLS configuration.
+	CertWatcher CertProvider
 }
 
 // TokenConfig holds the token-specific configuration.
@@ -569,6 +578,42 @@ func GetCollectionClient(
 func constructMongoClientOptions(
 	mongoConfig MongoDBConfig,
 ) (*options.ClientOptions, error) {
+	var tlsConfig *tls.Config
+
+	// Use CertWatcher if provided for automatic certificate rotation
+	if mongoConfig.CertWatcher != nil {
+		slog.Info("Using certificate watcher for TLS configuration with automatic rotation support")
+
+		tlsConfig = mongoConfig.CertWatcher.GetTLSConfig()
+	} else {
+		// Fall back to static certificate loading (backward compatible)
+		var err error
+
+		tlsConfig, err = constructStaticTLSConfig(mongoConfig)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	credential := options.Credential{
+		AuthMechanism: "MONGODB-X509",
+		AuthSource:    "$external",
+	}
+
+	// Set server selection timeout to allow MongoDB time to become ready
+	// This uses the same timeout as the ping timeout for consistency
+	serverSelectionTimeout := time.Duration(mongoConfig.TotalPingTimeoutSeconds) * time.Second
+
+	return options.Client().
+		ApplyURI(mongoConfig.URI).
+		SetTLSConfig(tlsConfig).
+		SetAuth(credential).
+		SetServerSelectionTimeout(serverSelectionTimeout), nil
+}
+
+// constructStaticTLSConfig creates a TLS config with statically loaded certificates.
+// This is the backward-compatible path when certificate rotation is not enabled.
+func constructStaticTLSConfig(mongoConfig MongoDBConfig) (*tls.Config, error) {
 	timeout := mongoConfig.TotalCACertTimeoutSeconds
 	if timeout == 0 {
 		timeout = 600 // 10 minutes by default
@@ -602,26 +647,11 @@ func constructMongoClientOptions(
 		return nil, fmt.Errorf("failed to load client certificate and key: %w", err)
 	}
 
-	tlsConfig := &tls.Config{
+	return &tls.Config{
 		Certificates: []tls.Certificate{clientCert},
 		RootCAs:      caCertPool,
 		MinVersion:   tls.VersionTLS12,
-	}
-
-	credential := options.Credential{
-		AuthMechanism: "MONGODB-X509",
-		AuthSource:    "$external",
-	}
-
-	// Set server selection timeout to allow MongoDB time to become ready
-	// This uses the same timeout as the ping timeout for consistency
-	serverSelectionTimeout := time.Duration(mongoConfig.TotalPingTimeoutSeconds) * time.Second
-
-	return options.Client().
-		ApplyURI(mongoConfig.URI).
-		SetTLSConfig(tlsConfig).
-		SetAuth(credential).
-		SetServerSelectionTimeout(serverSelectionTimeout), nil
+	}, nil
 }
 
 func ConstructClientTLSConfig(
