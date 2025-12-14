@@ -50,6 +50,12 @@ type CertWatcher struct {
 // New creates a new CertWatcher that monitors the given certificate files.
 // It performs an initial load of all certificates.
 func New(certPath, keyPath, caCertPath string) (*CertWatcher, error) {
+	if certPath == "" || keyPath == "" || caCertPath == "" {
+		return nil, errors.New("failed to create certificate watcher: " +
+			"certificate, key, and CA certificate paths must be provided",
+		)
+	}
+
 	cw := &CertWatcher{
 		certPath:   certPath,
 		keyPath:    keyPath,
