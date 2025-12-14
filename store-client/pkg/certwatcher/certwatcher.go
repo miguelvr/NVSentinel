@@ -37,14 +37,16 @@ type CertWatcher struct {
 	keyPath    string
 	caCertPath string
 
-	ready atomic.Bool
-
 	mu         sync.RWMutex
 	clientCert *tls.Certificate
 	caCertPool *x509.CertPool
 
 	watcher *fsnotify.Watcher
-	logger  *slog.Logger
+	ready   atomic.Bool
+	wg      sync.WaitGroup
+	cancel  context.CancelFunc
+
+	logger *slog.Logger
 }
 
 // New creates a new CertWatcher that monitors the given certificate files.
@@ -78,6 +80,9 @@ func New(certPath, keyPath, caCertPath string) (*CertWatcher, error) {
 // Start begins watching certificate files for changes.
 // It runs until the context is cancelled.
 func (cw *CertWatcher) Start(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
+	cw.cancel = cancel
+
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
 		return fmt.Errorf("failed to create file watcher: %w", err)
@@ -104,7 +109,9 @@ func (cw *CertWatcher) Start(ctx context.Context) error {
 		cw.logger.Info("Watching directory for certificate changes", "directory", dir)
 	}
 
-	go cw.watchLoop(ctx)
+	cw.wg.Go(func() {
+		cw.watchLoop(ctx)
+	})
 
 	return nil
 }
@@ -117,6 +124,12 @@ func (cw *CertWatcher) Ready() bool {
 // Stop stops the certificate watcher.
 func (cw *CertWatcher) Stop() error {
 	cw.ready.Store(false)
+
+	if cw.cancel != nil {
+		cw.cancel()
+	}
+
+	cw.wg.Wait()
 
 	if cw.watcher != nil {
 		return cw.watcher.Close()
