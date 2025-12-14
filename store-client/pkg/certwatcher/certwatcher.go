@@ -111,6 +111,7 @@ func (cw *CertWatcher) Ready() bool {
 // Stop stops the certificate watcher.
 func (cw *CertWatcher) Stop() error {
 	cw.ready.Store(false)
+
 	if cw.watcher != nil {
 		return cw.watcher.Close()
 	}
@@ -147,14 +148,18 @@ func (cw *CertWatcher) watchLoop(ctx context.Context) {
 }
 
 func (cw *CertWatcher) handleFileEvent(event fsnotify.Event) {
-	// Only handle write and create events
-	if !event.Has(fsnotify.Write) && !event.Has(fsnotify.Create) {
+	// Ignore chmod events - only handle content/path changes
+	if event.Has(fsnotify.Chmod) {
 		return
 	}
 
 	filename := filepath.Base(event.Name)
 
-	// Check if this event is for one of our certificate files
+	// Reload on Write, Create, Remove, and Rename events.
+	// This handles both direct file modifications and symlink-based rotations
+	// (e.g., Kubernetes secrets). If reload fails (e.g., file temporarily
+	// unavailable mid-rotation), we keep the previous certificate and the
+	// next event will retry.
 	switch filename {
 	case filepath.Base(cw.certPath), filepath.Base(cw.keyPath):
 		cw.logger.Info("Client certificate file changed, reloading",
