@@ -110,6 +110,7 @@ func (cw *CertWatcher) Ready() bool {
 
 // Stop stops the certificate watcher.
 func (cw *CertWatcher) Stop() error {
+	cw.ready.Store(false)
 	if cw.watcher != nil {
 		return cw.watcher.Close()
 	}
