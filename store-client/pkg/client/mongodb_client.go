@@ -344,9 +344,10 @@ func NewMongoDBClient(ctx context.Context, dbConfig config.DatabaseConfig) (*Mon
 	}
 
 	// Initialize certificate watcher if rotation is enabled
-	var certWatcher *certwatcher.CertWatcher
-
-	cwCtx, cwCancel := context.WithCancel(context.Background())
+	var (
+		certWatcher *certwatcher.CertWatcher
+		cwCancel    context.CancelFunc = func() {}
+	)
 
 	if config.IsCertRotationEnabled() {
 		slog.Info("Certificate rotation enabled, initializing certificate watcher")
@@ -363,6 +364,9 @@ func NewMongoDBClient(ctx context.Context, dbConfig config.DatabaseConfig) (*Mon
 				err,
 			)
 		}
+
+		cwCtx, cancel := context.WithCancel(context.Background())
+		cwCancel = cancel
 
 		// Start watching for certificate changes
 		if err := cw.Start(cwCtx); err != nil {
@@ -752,6 +756,7 @@ func (c *MongoDBClient) NewChangeStreamWatcher(ctx context.Context, tokenConfig 
 		TotalCACertIntervalSeconds:       c.config.GetTimeoutConfig().GetCACertIntervalSeconds(),
 		ChangeStreamRetryDeadlineSeconds: c.config.GetTimeoutConfig().GetChangeStreamRetryDeadlineSeconds(),
 		ChangeStreamRetryIntervalSeconds: c.config.GetTimeoutConfig().GetChangeStreamRetryIntervalSeconds(),
+		CertWatcher:                      c.certWatcher,
 	}
 
 	storeTokenConfig := mongoWatcher.TokenConfig{
