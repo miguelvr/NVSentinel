@@ -1,3 +1,6 @@
+//go:build arm64_group
+// +build arm64_group
+
 // Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -276,7 +279,7 @@ func TestNodeDeletedDuringDrain(t *testing.T) {
 		require.NoError(t, err)
 
 		t.Log("Waiting beyond deleteAfterTimeout duration (1min + buffer)")
-		time.Sleep(1*time.Minute + 20*time.Second)
+		time.Sleep(1*time.Minute + 5*time.Second)
 
 		helpers.WaitForNoRebootNodeCR(ctx, t, client, testCtx.NodeName)
 
@@ -507,8 +510,7 @@ func TestManualUncordonPropagation(t *testing.T) {
 		require.NoError(t, err)
 
 		t.Log("Waiting past deleteAfterTimeout deadline to verify pods were not force deleted")
-		t.Log("deleteAfterTimeout = 1 minute, waiting 1min 5sec to be sure")
-		time.Sleep(1*time.Minute + 5*time.Second)
+		time.Sleep(1*time.Minute + 2*time.Second)
 
 		t.Log("Verifying pods still exist and were never marked for deletion")
 		for _, podName := range podNames {

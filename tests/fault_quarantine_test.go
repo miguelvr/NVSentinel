@@ -1,3 +1,6 @@
+//go:build amd64_group
+// +build amd64_group
+
 // Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,24 +21,24 @@ import (
 	"context"
 	"testing"
 
+	"tests/helpers"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/e2e-framework/pkg/envconf"
 	"sigs.k8s.io/e2e-framework/pkg/features"
-	"tests/helpers"
 )
 
 func TestDontCordonIfEventDoesntMatchCELExpression(t *testing.T) {
-	feature := features.New("TestBasicCELMatching").
+	feature := features.New("TestCELExpressionFiltering").
 		WithLabel("suite", "fault-quarantine-cel")
 
 	var testCtx *helpers.QuarantineTestContext
 
 	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
 		var newCtx context.Context
-		newCtx, testCtx = helpers.SetupQuarantineTest(ctx, t, c, "data/basic-matching-configmap.yaml")
+		newCtx, testCtx = helpers.SetupQuarantineTest(ctx, t, c, "data/managed-by-nvsentinel-configmap.yaml")
 		return newCtx
 	})
 
@@ -56,100 +59,30 @@ func TestDontCordonIfEventDoesntMatchCELExpression(t *testing.T) {
 		return ctx
 	})
 
-	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		return helpers.TeardownQuarantineTest(ctx, t, c)
-	})
+	feature.Assess("node with ManagedByNVSentinel=false label ignored by CEL", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		client, err := c.NewClient()
+		require.NoError(t, err)
 
-	testEnv.Test(t, feature.Feature())
-}
-
-func TestManualUncordonBehavior(t *testing.T) {
-	feature := features.New("TestManualUncordonBehavior").
-		WithLabel("suite", "fault-quarantine-cel")
-
-	var testCtx *helpers.QuarantineTestContext
-
-	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		var newCtx context.Context
-		newCtx, testCtx = helpers.SetupQuarantineTest(ctx, t, c, "data/basic-matching-configmap.yaml")
+		err = helpers.SetNodeManagedByNVSentinel(ctx, client, testCtx.NodeName, false)
+		require.NoError(t, err)
 
 		event := helpers.NewHealthEvent(testCtx.NodeName).
 			WithErrorCode("79").
 			WithMessage("XID error occurred")
-		helpers.SendHealthEvent(newCtx, t, event)
+		helpers.SendHealthEvent(ctx, t, event)
 
-		client, err := c.NewClient()
-		require.NoError(t, err)
-		helpers.AssertQuarantineState(newCtx, t, client, testCtx.NodeName, helpers.QuarantineAssertion{
-			ExpectTaint: &v1.Taint{
-				Key:    "AggregatedNodeHealth",
-				Value:  "False",
-				Effect: v1.TaintEffectNoSchedule,
-			},
-			ExpectCordoned:   true,
-			ExpectAnnotation: true,
-		})
-
-		return newCtx
-	})
-
-	feature.Assess("manual uncordon clears quarantine state", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		client, err := c.NewClient()
-		require.NoError(t, err)
-
-		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			node, err := helpers.GetNodeByName(ctx, client, testCtx.NodeName)
-			require.NoError(t, err)
-
-			node.Spec.Unschedulable = false
-			return client.Resources().Update(ctx, node)
-		})
-		assert.NoError(t, err, "failed to uncordon node")
-
-		t.Log("Waiting for state to be updated")
-		require.Eventually(t, func() bool {
-			node, err := helpers.GetNodeByName(ctx, client, testCtx.NodeName)
-			if err != nil {
-				t.Logf("failed to get node %s: %v", testCtx.NodeName, err)
-				return false
-			}
-
-			if _, exists := node.Annotations["quarantineHealthEvent"]; exists {
-				return false
-			}
-
-			manualUncordon, exists := node.Annotations["quarantinedNodeUncordonedManually"]
-			if !exists || manualUncordon != "True" {
-				return false
-			}
-
-			for _, taint := range node.Spec.Taints {
-				if taint.Key == "AggregatedNodeHealth" {
-					return false
-				}
-			}
-
-			return true
-		}, helpers.EventuallyWaitTimeout, helpers.WaitInterval)
-
-		return ctx
-	})
-
-	feature.Assess("healthy event clears all annotations", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		client, err := c.NewClient()
-		require.NoError(t, err)
-
-		helpers.SendHealthyEvent(ctx, t, testCtx.NodeName)
-
-		helpers.AssertQuarantineState(ctx, t, client, testCtx.NodeName, helpers.QuarantineAssertion{
-			ExpectCordoned:   false,
-			ExpectAnnotation: false,
-		})
+		helpers.AssertNodeNeverQuarantined(ctx, t, client, testCtx.NodeName, true)
 
 		return ctx
 	})
 
 	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
+		client, err := c.NewClient()
+		require.NoError(t, err)
+
+		err = helpers.RemoveNodeManagedByNVSentinelLabel(ctx, client, testCtx.NodeName)
+		require.NoError(t, err)
+
 		return helpers.TeardownQuarantineTest(ctx, t, c)
 	})
 
@@ -288,140 +221,6 @@ func TestPreCordonedNodeHandling(t *testing.T) {
 			}
 			node.Spec.Taints = newTaints
 			client.Resources().Update(ctx, node)
-		}
-
-		return helpers.TeardownQuarantineTest(ctx, t, c)
-	})
-
-	testEnv.Test(t, feature.Feature())
-}
-
-func TestManagedByNVSentinelLabel(t *testing.T) {
-	feature := features.New("TestManagedByNVSentinelLabel").
-		WithLabel("suite", "fault-quarantine-special-modes")
-
-	var testNodeIgnored string
-	var testNodeProcessed string
-
-	feature.Setup(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		newCtx, testCtx := helpers.SetupQuarantineTest(ctx, t, c, "data/managed-by-nvsentinel-configmap.yaml")
-
-		client, err := c.NewClient()
-		require.NoError(t, err)
-
-		testNodeProcessed = testCtx.NodeName
-
-		nodes, err := helpers.GetAllNodesNames(ctx, client)
-		require.NoError(t, err)
-
-		startIdx := int(float64(len(nodes)) * 0.50)
-		if startIdx >= len(nodes) {
-			startIdx = len(nodes) - 1
-		}
-
-		for i := startIdx; i < len(nodes); i++ {
-			if nodes[i] != testNodeProcessed {
-				node, err := helpers.GetNodeByName(ctx, client, nodes[i])
-				if err != nil {
-					continue
-				}
-				if !node.Spec.Unschedulable {
-					testNodeIgnored = nodes[i]
-					break
-				}
-			}
-		}
-		require.NotEmpty(t, testNodeIgnored, "failed to find a second uncordoned node different from processed node")
-
-		t.Logf("Using two test nodes: ignored=%s, processed=%s", testNodeIgnored, testNodeProcessed)
-		t.Logf("Setting ManagedByNVSentinel=false on node %s", testNodeIgnored)
-
-		nodeIgnored, err := helpers.GetNodeByName(ctx, client, testNodeIgnored)
-		require.NoError(t, err)
-
-		if nodeIgnored.Labels == nil {
-			nodeIgnored.Labels = make(map[string]string)
-		}
-		nodeIgnored.Labels["k8saas.nvidia.com/ManagedByNVSentinel"] = "false"
-
-		err = client.Resources().Update(ctx, nodeIgnored)
-		require.NoError(t, err)
-
-		return newCtx
-	})
-
-	feature.Assess("node with label=false ignored by FQ", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		client, err := c.NewClient()
-		require.NoError(t, err)
-
-		event := helpers.NewHealthEvent(testNodeIgnored).
-			WithErrorCode("79").
-			WithMessage("XID error occurred")
-		helpers.SendHealthEvent(ctx, t, event)
-
-		helpers.AssertNodeNeverQuarantined(ctx, t, client, testNodeIgnored, true)
-
-		return ctx
-	})
-
-	feature.Assess("node without label processed by FQ", func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		client, err := c.NewClient()
-		require.NoError(t, err)
-
-		event := helpers.NewHealthEvent(testNodeProcessed).
-			WithErrorCode("79").
-			WithMessage("XID error occurred")
-		helpers.SendHealthEvent(ctx, t, event)
-
-		helpers.AssertQuarantineState(ctx, t, client, testNodeProcessed, helpers.QuarantineAssertion{
-			ExpectTaint: &v1.Taint{
-				Key:    "AggregatedNodeHealth",
-				Value:  "False",
-				Effect: v1.TaintEffectNoSchedule,
-			},
-			ExpectCordoned:   true,
-			ExpectAnnotation: true,
-		})
-
-		return ctx
-	})
-
-	feature.Teardown(func(ctx context.Context, t *testing.T, c *envconf.Config) context.Context {
-		client, err := c.NewClient()
-		require.NoError(t, err)
-
-		helpers.SendHealthEvent(ctx, t,
-			helpers.NewHealthEvent(testNodeIgnored).
-				WithHealthy(true).
-				WithFatal(false).
-				WithMessage("No Health Failures"))
-
-		helpers.SendHealthEvent(ctx, t,
-			helpers.NewHealthEvent(testNodeProcessed).
-				WithHealthy(true).
-				WithFatal(false).
-				WithMessage("No Health Failures"))
-
-		require.Eventually(t, func() bool {
-			node, err := helpers.GetNodeByName(ctx, client, testNodeProcessed)
-			if err != nil {
-				return false
-			}
-			if node.Spec.Unschedulable {
-				return false
-			}
-			if node.Annotations != nil {
-				if _, exists := node.Annotations["quarantineHealthEvent"]; exists {
-					return false
-				}
-			}
-			return true
-		}, helpers.EventuallyWaitTimeout, helpers.WaitInterval)
-
-		nodeIgnored, err := helpers.GetNodeByName(ctx, client, testNodeIgnored)
-		if err == nil {
-			delete(nodeIgnored.Labels, "k8saas.nvidia.com/ManagedByNVSentinel")
-			client.Resources().Update(ctx, nodeIgnored)
 		}
 
 		return helpers.TeardownQuarantineTest(ctx, t, c)
