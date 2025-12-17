@@ -25,9 +25,9 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 
 	"github.com/nvidia/nvsentinel/data-models/pkg/model"
-	"github.com/nvidia/nvsentinel/store-client/pkg/certwatcher"
 	"github.com/nvidia/nvsentinel/store-client/pkg/config"
 	"github.com/nvidia/nvsentinel/store-client/pkg/datastore"
 	mongoWatcher "github.com/nvidia/nvsentinel/store-client/pkg/datastore/providers/mongodb/watcher"
@@ -309,12 +309,13 @@ func BuildQuarantinedAndDrainedNodesPipeline() datastore.Pipeline {
 
 // MongoDBClient implements DatabaseClient for MongoDB
 type MongoDBClient struct {
-	client      *mongo.Client
-	database    string
-	collection  string
-	mongoCol    *mongo.Collection
-	config      config.DatabaseConfig
-	certWatcher *certwatcher.CertWatcher
+	client            *mongo.Client
+	database          string
+	collection        string
+	mongoCol          *mongo.Collection
+	config            config.DatabaseConfig
+	certWatcher       *certwatcher.CertWatcher
+	certWatcherCancel context.CancelFunc
 }
 
 // MongoDBCollectionClient implements CollectionClient for MongoDB
@@ -343,17 +344,19 @@ func NewMongoDBClient(ctx context.Context, dbConfig config.DatabaseConfig) (*Mon
 	}
 
 	// Initialize certificate watcher if rotation is enabled
-	var certWatcherInstance *certwatcher.CertWatcher
+	var certWatcher *certwatcher.CertWatcher
+
+	cwCtx, cwCancel := context.WithCancel(context.Background())
 
 	if config.IsCertRotationEnabled() {
 		slog.Info("Certificate rotation enabled, initializing certificate watcher")
 
-		cw, err := certwatcher.New(
-			dbConfig.GetCertConfig().GetCertPath(),
-			dbConfig.GetCertConfig().GetKeyPath(),
-			dbConfig.GetCertConfig().GetCACertPath(),
-		)
+		certConfig := dbConfig.GetCertConfig()
+
+		cw, err := certwatcher.New(certConfig.GetCertPath(), certConfig.GetKeyPath())
 		if err != nil {
+			cwCancel()
+
 			return nil, datastore.NewConnectionError(
 				datastore.ProviderMongoDB,
 				"failed to initialize certificate watcher",
@@ -362,7 +365,9 @@ func NewMongoDBClient(ctx context.Context, dbConfig config.DatabaseConfig) (*Mon
 		}
 
 		// Start watching for certificate changes
-		if err := cw.Start(ctx); err != nil {
+		if err := cw.Start(cwCtx); err != nil {
+			cwCancel()
+
 			return nil, datastore.NewConnectionError(
 				datastore.ProviderMongoDB,
 				"failed to start certificate watcher",
@@ -370,7 +375,7 @@ func NewMongoDBClient(ctx context.Context, dbConfig config.DatabaseConfig) (*Mon
 			)
 		}
 
-		certWatcherInstance = cw
+		certWatcher = cw
 		mongoConfig.CertWatcher = cw
 
 		slog.Info("Certificate watcher started successfully")
@@ -379,10 +384,7 @@ func NewMongoDBClient(ctx context.Context, dbConfig config.DatabaseConfig) (*Mon
 	// Use the existing GetCollectionClient function for consistency
 	mongoCol, err := mongoWatcher.GetCollectionClient(ctx, mongoConfig)
 	if err != nil {
-		// Clean up cert watcher if connection fails
-		if certWatcherInstance != nil {
-			_ = certWatcherInstance.Stop()
-		}
+		cwCancel()
 
 		return nil, datastore.NewConnectionError(
 			datastore.ProviderMongoDB,
@@ -395,12 +397,13 @@ func NewMongoDBClient(ctx context.Context, dbConfig config.DatabaseConfig) (*Mon
 	client := mongoCol.Database().Client()
 
 	return &MongoDBClient{
-		client:      client,
-		database:    dbConfig.GetDatabaseName(),
-		collection:  dbConfig.GetCollectionName(),
-		mongoCol:    mongoCol,
-		config:      dbConfig,
-		certWatcher: certWatcherInstance,
+		client:            client,
+		database:          dbConfig.GetDatabaseName(),
+		collection:        dbConfig.GetCollectionName(),
+		mongoCol:          mongoCol,
+		config:            dbConfig,
+		certWatcher:       certWatcher,
+		certWatcherCancel: cwCancel,
 	}, nil
 }
 
@@ -801,11 +804,9 @@ func (c *MongoDBClient) NewChangeStreamWatcher(ctx context.Context, tokenConfig 
 
 // Close closes the MongoDB client and stops the certificate watcher if running
 func (c *MongoDBClient) Close(ctx context.Context) error {
-	// Stop certificate watcher if it was started
-	if c.certWatcher != nil {
-		if err := c.certWatcher.Stop(); err != nil {
-			slog.Error("Failed to stop certificate watcher", "error", err)
-		}
+	// Stop certificate watcher by canceling its context
+	if c.certWatcherCancel != nil {
+		c.certWatcherCancel()
 	}
 
 	return c.client.Disconnect(ctx)

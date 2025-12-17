@@ -33,6 +33,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 	"go.mongodb.org/mongo-driver/mongo/readpref"
 	"go.mongodb.org/mongo-driver/mongo/writeconcern"
+	"sigs.k8s.io/controller-runtime/pkg/certwatcher"
 )
 
 // Event represents a database-agnostic event that abstracts away provider-specific types
@@ -42,12 +43,6 @@ type MongoDBClientTLSCertConfig struct {
 	TlsCertPath string
 	TlsKeyPath  string
 	CaCertPath  string
-}
-
-// CertProvider provides TLS configuration for certificate rotation support.
-// Implementations should return a tls.Config configured with dynamic certificate loading.
-type CertProvider interface {
-	GetTLSConfig() *tls.Config
 }
 
 // MongoDBConfig holds the MongoDB connection configuration.
@@ -62,9 +57,10 @@ type MongoDBConfig struct {
 	TotalCACertIntervalSeconds       int
 	ChangeStreamRetryDeadlineSeconds int
 	ChangeStreamRetryIntervalSeconds int
-	// CertWatcher is an optional certificate provider for automatic certificate rotation.
-	// When provided, it takes precedence over ClientTLSCertConfig for TLS configuration.
-	CertWatcher CertProvider
+	// CertWatcher is an optional certificate watcher for automatic client certificate rotation.
+	// When provided, GetCertificate is used for dynamic client certificate loading.
+	// CA certificates are still loaded statically from ClientTLSCertConfig.CaCertPath.
+	CertWatcher *certwatcher.CertWatcher
 }
 
 // TokenConfig holds the token-specific configuration.
@@ -578,17 +574,17 @@ func GetCollectionClient(
 func constructMongoClientOptions(
 	mongoConfig MongoDBConfig,
 ) (*options.ClientOptions, error) {
-	var tlsConfig *tls.Config
-
-	// Use CertWatcher if provided for automatic certificate rotation
+	var (
+		tlsConfig *tls.Config
+		err       error
+	)
+	// Use CertWatcher if provided for automatic client certificate rotation
 	if mongoConfig.CertWatcher != nil {
-		slog.Info("Using certificate watcher for TLS configuration with automatic rotation support")
-
-		tlsConfig = mongoConfig.CertWatcher.GetTLSConfig()
+		tlsConfig, err = constructDynamicTLSConfig(mongoConfig)
+		if err != nil {
+			return nil, err
+		}
 	} else {
-		// Fall back to static certificate loading (backward compatible)
-		var err error
-
 		tlsConfig, err = constructStaticTLSConfig(mongoConfig)
 		if err != nil {
 			return nil, err
@@ -611,9 +607,29 @@ func constructMongoClientOptions(
 		SetServerSelectionTimeout(serverSelectionTimeout), nil
 }
 
-// constructStaticTLSConfig creates a TLS config with statically loaded certificates.
-// This is the backward-compatible path when certificate rotation is not enabled.
-func constructStaticTLSConfig(mongoConfig MongoDBConfig) (*tls.Config, error) {
+func constructDynamicTLSConfig(mongoConfig MongoDBConfig) (*tls.Config, error) {
+	slog.Info("Using certificate watcher for TLS configuration with automatic rotation support")
+
+	// Load CA certificate statically (CA rotation is not supported)
+	caCertPool, err := loadCACertPool(mongoConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return &tls.Config{
+		// Use GetCertificate for dynamic client certificate loading
+		// Controller-runtime's certwatcher.GetCertificate returns *tls.Certificate
+		GetClientCertificate: func(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+			return mongoConfig.CertWatcher.GetCertificate(nil)
+		},
+		RootCAs:    caCertPool,
+		MinVersion: tls.VersionTLS12,
+	}, nil
+}
+
+// loadCACertPool loads the CA certificate pool from the config.
+// Used when certificate rotation is enabled for the client cert but CA remains static.
+func loadCACertPool(mongoConfig MongoDBConfig) (*x509.CertPool, error) {
 	timeout := mongoConfig.TotalCACertTimeoutSeconds
 	if timeout == 0 {
 		timeout = 600 // 10 minutes by default
@@ -628,11 +644,10 @@ func constructStaticTLSConfig(mongoConfig MongoDBConfig) (*tls.Config, error) {
 
 	intervalCert := time.Duration(interval) * time.Second
 
-	// load CA certificate
 	caCert, err := pollTillCACertIsMountedSuccessfully(mongoConfig.ClientTLSCertConfig.CaCertPath,
 		totalCertTimeout, intervalCert)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read CA certificate with error: %w", err)
+		return nil, fmt.Errorf("failed to read CA certificate: %w", err)
 	}
 
 	caCertPool := x509.NewCertPool()
@@ -640,7 +655,19 @@ func constructStaticTLSConfig(mongoConfig MongoDBConfig) (*tls.Config, error) {
 		return nil, fmt.Errorf("failed to append CA certificate to pool")
 	}
 
-	// load client certificate and key
+	return caCertPool, nil
+}
+
+// constructStaticTLSConfig creates a TLS config with statically loaded certificates.
+// This is the backward-compatible path when certificate rotation is not enabled.
+func constructStaticTLSConfig(mongoConfig MongoDBConfig) (*tls.Config, error) {
+	// Load CA certificate
+	caCertPool, err := loadCACertPool(mongoConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	// Load client certificate and key
 	clientCert, err := tls.LoadX509KeyPair(mongoConfig.ClientTLSCertConfig.TlsCertPath,
 		mongoConfig.ClientTLSCertConfig.TlsKeyPath)
 	if err != nil {
